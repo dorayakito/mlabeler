@@ -6,10 +6,14 @@ import mlabeler.core.audio.Audio
 import mlabeler.core.audio.Wav
 import java.awt.Cursor
 import java.awt.Desktop
+import java.awt.EventQueue
 import java.awt.FileDialog
 import java.awt.Frame
 import java.io.File
 import java.util.Locale
+import java.util.concurrent.FutureTask
+import javax.swing.JFileChooser
+import javax.swing.filechooser.FileNameExtensionFilter
 import javax.sound.sampled.AudioFormat
 import javax.sound.sampled.AudioSystem
 import javax.sound.sampled.SourceDataLine
@@ -54,39 +58,59 @@ actual object Platform {
 
     actual val hasNativeFolderPicker: Boolean = true
 
-    actual fun pickFileNative(title: String, extensions: List<String>, start: String?): String? {
-        runCatching { return NativeFolderDialog.pickFile(extensions, start) }.onFailure { System.err.println("native file dialog: $it") }
+    actual fun pickFileNative(title: String, extensions: List<String>, start: String?): String? = onEventThread {
+        // LWJGL's macOS NFD backend creates NSOpenPanel on the calling Java thread, but AppKit requires
+        // the process main thread (the Swing event thread is not sufficient). Use Swing's Java chooser.
+        if (isMac) return@onEventThread pickFileSwing(title, extensions, start)
+        runCatching { return@onEventThread NativeFolderDialog.pickFile(extensions, start) }.onFailure { System.err.println("native file dialog: $it") }
         val d = FileDialog(null as Frame?, title, FileDialog.LOAD)
         if (start != null) d.directory = start
         if (extensions.isNotEmpty()) d.setFilenameFilter { _, name -> extensions.any { name.endsWith(".$it", ignoreCase = true) } }
         d.isVisible = true
-        val dir = d.directory ?: return null
-        val file = d.file ?: return null
-        return File(dir, file).path
+        val dir = d.directory ?: return@onEventThread null
+        val file = d.file ?: return@onEventThread null
+        File(dir, file).path
     }
 
-    actual fun pickFolderNative(title: String, start: String?): String? {
-        // the system folder dialog (Explorer on Windows, with the address bar; GTK/portal on Linux; Finder on macOS)
-        runCatching { return NativeFolderDialog.pick(start) }.onFailure { System.err.println("native folder dialog: $it") }
-        if (isMac) {
-            System.setProperty("apple.awt.fileDialogForDirectories", "true")
-            try {
-                val d = FileDialog(null as Frame?, title, FileDialog.LOAD)
-                if (start != null) d.directory = start
-                d.isVisible = true
-                val dir = d.directory ?: return null
-                val file = d.file ?: return null
-                return File(dir, file).path
-            } finally {
-                System.setProperty("apple.awt.fileDialogForDirectories", "false")
-            }
-        }
+    actual fun pickFolderNative(title: String, start: String?): String? = onEventThread {
+        // the system folder dialog (Explorer on Windows, with the address bar; GTK/portal on Linux)
+        // LWJGL's macOS NFD backend creates NSOpenPanel on the calling Java thread, but AppKit requires
+        // the process main thread. Swing's Java chooser avoids that native thread restriction.
+        if (isMac) return@onEventThread pickFolderSwing(title, start)
+        runCatching { return@onEventThread NativeFolderDialog.pick(start) }.onFailure { System.err.println("native folder dialog: $it") }
         // last resort: an Open dialog where any file in the folder opens the folder
         val d = FileDialog(null as Frame?, title, FileDialog.LOAD)
         if (start != null) d.directory = start
         d.isVisible = true
-        val dir = d.directory ?: return null
-        return File(dir).path
+        val dir = d.directory ?: return@onEventThread null
+        File(dir).path
+    }
+
+    private fun pickFileSwing(title: String, extensions: List<String>, start: String?): String? {
+        val chooser = JFileChooser().apply {
+            dialogTitle = title
+            fileSelectionMode = JFileChooser.FILES_ONLY
+            start?.let { File(it) }?.let { if (it.isDirectory) currentDirectory = it else selectedFile = it }
+            if (extensions.isNotEmpty()) fileFilter = FileNameExtensionFilter(extensions.joinToString(", "), *extensions.toTypedArray())
+        }
+        return if (chooser.showOpenDialog(null) == JFileChooser.APPROVE_OPTION) chooser.selectedFile?.absolutePath else null
+    }
+
+    private fun pickFolderSwing(title: String, start: String?): String? {
+        val chooser = JFileChooser().apply {
+            dialogTitle = title
+            fileSelectionMode = JFileChooser.DIRECTORIES_ONLY
+            start?.let { File(it) }?.takeIf { it.isDirectory }?.let { currentDirectory = it }
+        }
+        return if (chooser.showOpenDialog(null) == JFileChooser.APPROVE_OPTION) chooser.selectedFile?.absolutePath else null
+    }
+
+    /** Desktop file choosers must be created on AWT's event thread. */
+    private fun <T> onEventThread(action: () -> T): T {
+        if (EventQueue.isDispatchThread()) return action()
+        val task = FutureTask<T> { action() }
+        EventQueue.invokeAndWait(task)
+        return task.get()
     }
 
     private val ffmpeg: String? by lazy {
